@@ -47,10 +47,10 @@ class SoundDevice:
 
 
 class Model:
-    __slots__ = ['v', 'loop', 'running', 'logger', 'discord_bot_token', 'discord_client', 'login_status', 'current_viewing_guild', 'input_stream', 'audio_warning_count', 'audio_queue', 'muted', 'opus_encoder', 'opus_encoder_private', 'opus_encoder_executor', 'lu_meter']
+    __slots__ = ['v', 'loop', 'running', 'logger', 'discord_bot_token', 'discord_client', 'login_status', 'current_viewing_guild', 'input_stream', 'audio_warning_count', 'audio_queue', 'muted', 'opus_encoder', 'opus_encoder_private', 'opus_encoder_executor', 'lu_meter', 'auto_join_channel_id']
     muted_frame = array.array('f', [0.0] * (48000 * 20 // 1000 * 2))
 
-    def __init__(self, discord_bot_token: str, loop: asyncio.AbstractEventLoop) -> None:
+    def __init__(self, discord_bot_token: str, loop: asyncio.AbstractEventLoop, auto_join_channel_id: typing.Optional[str] = None) -> None:
         self.v: typing.Optional['view.View'] = None
         self.loop = loop
         self.running = True
@@ -84,6 +84,7 @@ class Model:
         self.opus_encoder_executor = concurrent.futures.ThreadPoolExecutor(1)
 
         self.lu_meter = lumeter.LUMeter(self.loop)
+        self.auto_join_channel_id = auto_join_channel_id
 
         self._set_up_events()
 
@@ -116,6 +117,23 @@ class Model:
             if self.v is not None:
                 self.v.loop.call_soon_threadsafe(self.v.login_status_updated)
                 self.v.loop.call_soon_threadsafe(self.v.guilds_updated)
+            # Auto-join logic
+            if self.auto_join_channel_id:
+                channel: typing.Optional[discord.VoiceChannel] = None
+                for guild in self.discord_client.guilds:
+                    guild = typing.cast(discord.Guild, guild)
+                    for ch in guild.channels:
+                        ch = typing.cast(discord.abc.GuildChannel, ch)
+                        if isinstance(ch, discord.VoiceChannel) and str(ch.id) == str(self.auto_join_channel_id):
+                            channel = ch
+                            break
+                    if channel:
+                        break
+                if channel:
+                    self.logger.info(f'Auto-joining voice channel: {channel.name} (ID: {channel.id})')
+                    await self.join_voice(channel)
+                else:
+                    self.logger.warning(f'Voice channel with ID {self.auto_join_channel_id} not found for auto-join.')
 
         self.discord_client.event(on_ready)
 

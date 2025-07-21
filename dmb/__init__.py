@@ -19,12 +19,14 @@ import concurrent.futures
 import threading
 from . import model
 from . import view
+from typing import Optional
 
 
 class ModelThread(threading.Thread):
-    def __init__(self, discord_bot_token: str) -> None:
+    def __init__(self, discord_bot_token: str, auto_join_channel_id: Optional[str] = None) -> None:
         super().__init__()
         self.discord_bot_token = discord_bot_token
+        self.auto_join_channel_id = auto_join_channel_id
         self.init_finished: concurrent.futures.Future[model.Model] = concurrent.futures.Future()
 
     def run(self) -> None:
@@ -32,7 +34,7 @@ class ModelThread(threading.Thread):
         loop.run_until_complete(self._run(loop))
 
     async def _run(self, loop: asyncio.AbstractEventLoop) -> None:
-        m = model.Model(self.discord_bot_token, loop)
+        m = model.Model(self.discord_bot_token, loop, self.auto_join_channel_id)
         self.init_finished.set_result(m)
         await m.run()
 
@@ -53,7 +55,9 @@ class UIThread:
 def main() -> None:
     try:
         with open('token.txt', 'r') as token_file:
-            discord_bot_token = token_file.read().strip()
+            lines = token_file.read().strip().splitlines()
+            discord_bot_token = lines[0] if len(lines) > 0 else ''
+            auto_join_channel_id: Optional[str] = lines[1] if len(lines) > 1 else None
         if not discord_bot_token:
             raise ValueError
     except (FileNotFoundError, ValueError):
@@ -61,7 +65,7 @@ def main() -> None:
         print('Please put your Discord bot token in token.txt.')
         return
 
-    model_thread = ModelThread(discord_bot_token)
+    model_thread = ModelThread(discord_bot_token, auto_join_channel_id)
     model_thread.start()
     m = model_thread.init_finished.result()
 
