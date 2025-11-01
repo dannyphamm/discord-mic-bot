@@ -254,8 +254,33 @@ class Model:
 
     async def join_voice(self, channel: discord.VoiceChannel) -> None:
         try:
-            await channel.connect()
-        except Exception:
+            # Disconnect from any existing voice connections in the same guild first
+            for voice_client in typing.cast(typing.List[discord.VoiceClient], self.discord_client.voice_clients):
+                if voice_client.guild == channel.guild and voice_client.is_connected():
+                    try:
+                        await voice_client.disconnect(force=True)
+                        await asyncio.sleep(0.1)  # Give it time to clean up
+                    except Exception:
+                        pass
+            
+            voice_client = await channel.connect()
+            # Wait for connection to be fully ready
+            await asyncio.sleep(0.5)
+            
+            # Verify the connection is actually established and ready
+            if not voice_client.is_connected():
+                self.logger.error('Voice connection not established properly')
+                return
+                
+            # Verify websocket is ready
+            ws = getattr(voice_client, '_ws', None) or getattr(voice_client, 'ws', None)
+            if ws is None:
+                self.logger.warning('Voice websocket not available after connection')
+            else:
+                self.logger.info('Voice connection established successfully')
+                
+        except Exception as e:
+            self.logger.error('Failed to join voice channel: {}'.format(str(e)))
             traceback.print_exc()
             return
 
@@ -383,7 +408,7 @@ class Model:
 
                 if consecutive_silence <= 1:
                     for voice_client in typing.cast(typing.List[discord.VoiceClient], self.discord_client.voice_clients):
-                        if voice_client.is_connected():
+                        if voice_client.is_connected() and voice_client.channel is not None:
                             voice_client_name: str = typing.cast(discord.VoiceChannel, voice_client.channel).name
                             if getattr(voice_client, '_dmb_speaking', discord.SpeakingState.none) != discord.SpeakingState.voice:
                                 self.logger.info('Start speaking on: {}'.format(voice_client_name))
@@ -391,9 +416,12 @@ class Model:
                             elif timestamp_ns - getattr(voice_client, '_dmb_last_spoke', timestamp_ns) >= 60000000000:
                                 self.logger.info('Continue speaking on: {}'.format(voice_client_name))
                                 self._set_speaking_state(voice_client, discord.SpeakingState.voice, timestamp_ns)
+                        elif not voice_client.is_connected():
+                            # Log disconnections for debugging
+                            self.logger.warning('Voice client disconnected during encoding loop')
                 else:
                     for voice_client in typing.cast(typing.List[discord.VoiceClient], self.discord_client.voice_clients):
-                        if voice_client.is_connected():
+                        if voice_client.is_connected() and voice_client.channel is not None:
                             voice_client_name: str = typing.cast(discord.VoiceChannel, voice_client.channel).name
                             if getattr(voice_client, '_dmb_speaking', discord.SpeakingState.none) != discord.SpeakingState.none:
                                 self.logger.info('Stop speaking on: {}'.format(voice_client_name))
@@ -404,10 +432,13 @@ class Model:
                 if consecutive_silence <= 5:
                     opus_packet = await self.loop.run_in_executor(self.opus_encoder_executor, self._encode_voice, buffer)
                     for voice_client in typing.cast(typing.List[discord.VoiceClient], self.discord_client.voice_clients):
-                        if voice_client.is_connected():
-                            send_func = self._send_audio_packet(voice_client, opus_packet, timestamp_frames)
-                            self.loop.call_soon(send_func)
-                            # self.loop.call_later(0.01, send_func)
+                        if voice_client.is_connected() and voice_client.channel is not None:
+                            try:
+                                send_func = self._send_audio_packet(voice_client, opus_packet, timestamp_frames)
+                                self.loop.call_soon(send_func)
+                                # self.loop.call_later(0.01, send_func)
+                            except Exception as e:
+                                self.logger.warning('Error preparing audio packet: {}'.format(str(e)))
 
                 timestamp_frames = (timestamp_frames + frame_size) & 0xffffffff
                 await lu_meter_future
@@ -431,17 +462,46 @@ class Model:
         def send() -> None:
             if sock is None:
                 return
+            if not voice_client.is_connected():
+                return
             try:
-                getattr(voice_client, '_connection').send_packet(udp_packet)
-            except OSError:
-                self.logger.warning('Network too slow, a packet is dropped. (seq={}, ts={})'.format(sequence, timestamp_frames))
+                connection = getattr(voice_client, '_connection', None)
+                if connection is not None:
+                    connection.send_packet(udp_packet)
+                else:
+                    # Fallback: try to send directly via socket
+                    if hasattr(voice_client, 'endpoint_ip') and hasattr(voice_client, 'voice_port'):
+                        try:
+                            sock.sendto(udp_packet, (voice_client.endpoint_ip, voice_client.voice_port))
+                        except Exception as e:
+                            self.logger.warning('Failed to send packet via socket: {}'.format(str(e)))
+                    else:
+                        self.logger.warning('Voice connection endpoint not available')
+            except AttributeError as e:
+                self.logger.warning('Voice connection attribute missing: {}'.format(str(e)))
+            except OSError as e:
+                self.logger.warning('Network error sending packet: {}'.format(str(e)))
 
         return send
 
     def _set_speaking_state(self, voice_client: discord.VoiceClient, state: int, timestamp_ns: int) -> None:
         setattr(voice_client, '_dmb_speaking', state)
         setattr(voice_client, '_dmb_last_spoke', timestamp_ns)
-        asyncio.ensure_future(voice_client.ws.speak(state), loop=self.loop)
+        try:
+            # Try to access the websocket - it might be _ws or ws
+            ws = getattr(voice_client, '_ws', None)
+            if ws is None:
+                ws = getattr(voice_client, 'ws', None)
+            
+            if ws is not None and hasattr(ws, 'speak'):
+                # speak() is a coroutine, schedule it
+                asyncio.ensure_future(ws.speak(state), loop=self.loop)
+            else:
+                self.logger.warning('Voice websocket not available or speak method missing')
+        except AttributeError as e:
+            self.logger.error('Failed to set speaking state: {}'.format(str(e)))
+        except Exception as e:
+            self.logger.error('Unexpected error setting speaking state: {}'.format(str(e)))
 
     def _encode_voice(self, buffer: 'array.array[float]') -> bytes:
         c_buffer = ctypes.cast(buffer.buffer_info()[0], ctypes.POINTER(ctypes.c_float))
