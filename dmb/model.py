@@ -258,18 +258,41 @@ class Model:
         
         for attempt in range(max_retries):
             try:
+                # Ensure the main Discord client is ready and connected first
+                if not self.discord_client.is_ready():
+                    self.logger.warning('Discord client not ready, waiting...')
+                    await asyncio.sleep(2.0)
+                    if not self.discord_client.is_ready():
+                        self.logger.error('Discord client is not ready after waiting')
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(retry_delay * 2)
+                            retry_delay *= 2
+                            continue
+                        return
+                
+                # Check if the gateway is connected
+                if hasattr(self.discord_client, 'ws') and self.discord_client.ws is not None:
+                    if hasattr(self.discord_client.ws, 'closed') and self.discord_client.ws.closed:
+                        self.logger.warning('Gateway websocket is closed, waiting for reconnection...')
+                        await asyncio.sleep(3.0)
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(retry_delay * 2)
+                            retry_delay *= 2
+                            continue
+                        return
+                
                 # Disconnect from any existing voice connections in the same guild first
                 for voice_client in typing.cast(typing.List[discord.VoiceClient], self.discord_client.voice_clients):
                     if voice_client.guild == channel.guild and voice_client.is_connected():
                         try:
                             await voice_client.disconnect(force=True)
-                            await asyncio.sleep(0.2)  # Give it time to clean up
+                            await asyncio.sleep(0.5)  # Give it more time to clean up
                         except Exception:
                             pass
                 
                 # Try to connect with increased timeout (60 seconds default, use 90 for slower connections)
                 self.logger.info('Attempting to connect to voice channel: {} (attempt {}/{})'.format(channel.name, attempt + 1, max_retries))
-                voice_client = await channel.connect(timeout=90.0, reconnect=False)
+                voice_client = await channel.connect(timeout=90.0, reconnect=True)
                 
                 # Wait for connection to be fully ready
                 await asyncio.sleep(0.5)
@@ -301,15 +324,42 @@ class Model:
                 else:
                     self.logger.error('Failed to connect after {} attempts'.format(max_retries))
                     return
-            except Exception as e:
-                self.logger.error('Failed to join voice channel: {} (attempt {}/{})'.format(str(e), attempt + 1, max_retries))
+            except discord.errors.ConnectionClosed as e:
+                # Error 4006 means session is no longer valid - need to wait longer
+                self.logger.error('Discord connection closed (code {}): {} (attempt {}/{})'.format(
+                    e.code if hasattr(e, 'code') else 'unknown', str(e), attempt + 1, max_retries))
                 if attempt < max_retries - 1:
-                    self.logger.info('Retrying in {} seconds...'.format(retry_delay))
-                    await asyncio.sleep(retry_delay)
+                    # For session errors, wait longer before retrying (gateway needs time to reconnect)
+                    wait_time = retry_delay * 3
+                    self.logger.info('Waiting {} seconds for gateway to reconnect before retrying...'.format(wait_time))
+                    await asyncio.sleep(wait_time)
                     retry_delay *= 2  # Exponential backoff
                 else:
-                    traceback.print_exc()
+                    self.logger.error('Failed to connect after {} attempts due to connection errors'.format(max_retries))
                     return
+            except Exception as e:
+                error_str = str(e)
+                # Check if it's a ConnectionClosed error even if not caught by the specific exception
+                if '4006' in error_str or 'Session is no longer valid' in error_str or 'WebSocket closed' in error_str:
+                    self.logger.error('Session error connecting to voice channel: {} (attempt {}/{})'.format(error_str, attempt + 1, max_retries))
+                    if attempt < max_retries - 1:
+                        # Wait longer for session errors
+                        wait_time = retry_delay * 3
+                        self.logger.info('Waiting {} seconds for gateway session to recover...'.format(wait_time))
+                        await asyncio.sleep(wait_time)
+                        retry_delay *= 2
+                    else:
+                        self.logger.error('Failed to connect after {} attempts due to session errors'.format(max_retries))
+                        return
+                else:
+                    self.logger.error('Failed to join voice channel: {} (attempt {}/{})'.format(str(e), attempt + 1, max_retries))
+                    if attempt < max_retries - 1:
+                        self.logger.info('Retrying in {} seconds...'.format(retry_delay))
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                    else:
+                        traceback.print_exc()
+                        return
 
         await self.loop.run_in_executor(self.opus_encoder_executor, self._reset_opus_encoder)
 
