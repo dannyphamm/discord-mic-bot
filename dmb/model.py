@@ -253,36 +253,63 @@ class Model:
             self.v.loop.call_soon_threadsafe(self.v.joined_updated)
 
     async def join_voice(self, channel: discord.VoiceChannel) -> None:
-        try:
-            # Disconnect from any existing voice connections in the same guild first
-            for voice_client in typing.cast(typing.List[discord.VoiceClient], self.discord_client.voice_clients):
-                if voice_client.guild == channel.guild and voice_client.is_connected():
-                    try:
-                        await voice_client.disconnect(force=True)
-                        await asyncio.sleep(0.1)  # Give it time to clean up
-                    except Exception:
-                        pass
-            
-            voice_client = await channel.connect()
-            # Wait for connection to be fully ready
-            await asyncio.sleep(0.5)
-            
-            # Verify the connection is actually established and ready
-            if not voice_client.is_connected():
-                self.logger.error('Voice connection not established properly')
-                return
+        max_retries = 3
+        retry_delay = 1.0
+        
+        for attempt in range(max_retries):
+            try:
+                # Disconnect from any existing voice connections in the same guild first
+                for voice_client in typing.cast(typing.List[discord.VoiceClient], self.discord_client.voice_clients):
+                    if voice_client.guild == channel.guild and voice_client.is_connected():
+                        try:
+                            await voice_client.disconnect(force=True)
+                            await asyncio.sleep(0.2)  # Give it time to clean up
+                        except Exception:
+                            pass
                 
-            # Verify websocket is ready
-            ws = getattr(voice_client, '_ws', None) or getattr(voice_client, 'ws', None)
-            if ws is None:
-                self.logger.warning('Voice websocket not available after connection')
-            else:
-                self.logger.info('Voice connection established successfully')
+                # Try to connect with increased timeout (60 seconds default, use 90 for slower connections)
+                self.logger.info('Attempting to connect to voice channel: {} (attempt {}/{})'.format(channel.name, attempt + 1, max_retries))
+                voice_client = await channel.connect(timeout=90.0, reconnect=False)
                 
-        except Exception as e:
-            self.logger.error('Failed to join voice channel: {}'.format(str(e)))
-            traceback.print_exc()
-            return
+                # Wait for connection to be fully ready
+                await asyncio.sleep(0.5)
+                
+                # Verify the connection is actually established and ready
+                if not voice_client.is_connected():
+                    self.logger.error('Voice connection not established properly')
+                    if attempt < max_retries - 1:
+                        self.logger.info('Retrying in {} seconds...'.format(retry_delay))
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                        continue
+                    return
+                    
+                # Verify websocket is ready
+                ws = getattr(voice_client, '_ws', None) or getattr(voice_client, 'ws', None)
+                if ws is None:
+                    self.logger.warning('Voice websocket not available after connection')
+                else:
+                    self.logger.info('Voice connection established successfully')
+                    break  # Success, exit retry loop
+                    
+            except asyncio.TimeoutError:
+                self.logger.error('Timeout connecting to voice channel: {} (attempt {}/{})'.format(channel.name, attempt + 1, max_retries))
+                if attempt < max_retries - 1:
+                    self.logger.info('Retrying in {} seconds...'.format(retry_delay))
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    self.logger.error('Failed to connect after {} attempts'.format(max_retries))
+                    return
+            except Exception as e:
+                self.logger.error('Failed to join voice channel: {} (attempt {}/{})'.format(str(e), attempt + 1, max_retries))
+                if attempt < max_retries - 1:
+                    self.logger.info('Retrying in {} seconds...'.format(retry_delay))
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    traceback.print_exc()
+                    return
 
         await self.loop.run_in_executor(self.opus_encoder_executor, self._reset_opus_encoder)
 
