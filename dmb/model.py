@@ -455,6 +455,8 @@ class Model:
     async def _encode_voice_loop(self) -> None:
         consecutive_silence = 0
         timestamp_frames = 0
+        # Track which voice clients were previously connected to avoid false disconnection warnings
+        previously_connected: typing.Set[int] = set()
 
         try:
             while self.running:
@@ -483,9 +485,18 @@ class Model:
 
                 lu_meter_future = self.lu_meter.push(buffer)
 
+                # Track current connections and detect actual disconnections
+                current_voice_clients = typing.cast(typing.List[discord.VoiceClient], self.discord_client.voice_clients)
+                currently_connected: typing.Set[int] = set()
+
                 if consecutive_silence <= 1:
-                    for voice_client in typing.cast(typing.List[discord.VoiceClient], self.discord_client.voice_clients):
+                    for voice_client in current_voice_clients:
                         if voice_client.is_connected() and voice_client.channel is not None:
+                            currently_connected.add(id(voice_client))
+                            # Mark as previously connected if not already tracked
+                            if id(voice_client) not in previously_connected:
+                                previously_connected.add(id(voice_client))
+                            
                             voice_client_name: str = typing.cast(discord.VoiceChannel, voice_client.channel).name
                             if getattr(voice_client, '_dmb_speaking', discord.SpeakingState.none) != discord.SpeakingState.voice:
                                 self.logger.info('Start speaking on: {}'.format(voice_client_name))
@@ -493,16 +504,26 @@ class Model:
                             elif timestamp_ns - getattr(voice_client, '_dmb_last_spoke', timestamp_ns) >= 60000000000:
                                 self.logger.info('Continue speaking on: {}'.format(voice_client_name))
                                 self._set_speaking_state(voice_client, discord.SpeakingState.voice, timestamp_ns)
-                        elif not voice_client.is_connected():
-                            # Log disconnections for debugging
-                            self.logger.warning('Voice client disconnected during encoding loop')
+                        elif id(voice_client) in previously_connected:
+                            # Only log if this client was previously connected (actual disconnection)
+                            voice_client_name = getattr(voice_client.channel, 'name', 'Unknown') if voice_client.channel else 'Unknown'
+                            self.logger.warning('Voice client disconnected during encoding loop: {}'.format(voice_client_name))
+                            previously_connected.discard(id(voice_client))
                 else:
-                    for voice_client in typing.cast(typing.List[discord.VoiceClient], self.discord_client.voice_clients):
+                    for voice_client in current_voice_clients:
                         if voice_client.is_connected() and voice_client.channel is not None:
+                            currently_connected.add(id(voice_client))
+                            if id(voice_client) not in previously_connected:
+                                previously_connected.add(id(voice_client))
+                            
                             voice_client_name: str = typing.cast(discord.VoiceChannel, voice_client.channel).name
                             if getattr(voice_client, '_dmb_speaking', discord.SpeakingState.none) != discord.SpeakingState.none:
                                 self.logger.info('Stop speaking on: {}'.format(voice_client_name))
                                 self._set_speaking_state(voice_client, discord.SpeakingState.none, timestamp_ns)
+                
+                # Clean up tracking for voice clients that no longer exist
+                current_ids = {id(vc) for vc in current_voice_clients}
+                previously_connected = {vc_id for vc_id in previously_connected if vc_id in current_ids}
 
                 # When there's a break in the sent data, the packet transmission shouldn't simply stop. Instead, send five frames of silence (0xF8, 0xFF, 0xFE) before stopping to avoid unintended Opus interpolation with subsequent transmissions.
                 # -- Discord SDK
