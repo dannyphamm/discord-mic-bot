@@ -47,7 +47,7 @@ class SoundDevice:
 
 
 class Model:
-    __slots__ = ['v', 'loop', 'running', 'logger', 'discord_bot_token', 'discord_client', 'login_status', 'current_viewing_guild', 'input_stream', 'audio_warning_count', 'audio_queue', 'muted', 'opus_encoder', 'opus_encoder_private', 'opus_encoder_executor', 'lu_meter', 'auto_join_channel_id']
+    __slots__ = ['v', 'loop', 'running', 'logger', 'discord_bot_token', 'discord_client', 'login_status', 'current_viewing_guild', 'input_stream', 'audio_warning_count', 'audio_queue', 'muted', 'opus_encoder', 'opus_encoder_private', 'opus_encoder_executor', 'lu_meter', 'auto_join_channel_id', 'desired_voice_channels', 'voice_reconnect_tasks', 'voice_send_failures']
     muted_frame = array.array('f', [0.0] * (48000 * 20 // 1000 * 2))
 
     def __init__(self, discord_bot_token: str, loop: asyncio.AbstractEventLoop, auto_join_channel_id: typing.Optional[str] = None) -> None:
@@ -85,6 +85,9 @@ class Model:
 
         self.lu_meter = lumeter.LUMeter(self.loop)
         self.auto_join_channel_id = auto_join_channel_id
+        self.desired_voice_channels: typing.Dict[int, int] = {}
+        self.voice_reconnect_tasks: typing.Dict[int, asyncio.Task[None]] = {}
+        self.voice_send_failures: typing.Dict[int, int] = {}
 
         self._set_up_events()
 
@@ -203,6 +206,13 @@ class Model:
         self.discord_client.event(on_guild_update)
 
         async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState) -> None:
+            current_user = self.discord_client.user
+            if current_user is not None and member.id == current_user.id:
+                # Follow where the bot is actually connected, so reconnects don't pin to an old channel.
+                if isinstance(after.channel, discord.VoiceChannel):
+                    self.desired_voice_channels[member.guild.id] = after.channel.id
+                else:
+                    self.desired_voice_channels.pop(member.guild.id, None)
             if self.v is not None:
                 self.v.loop.call_soon_threadsafe(self.v.joined_updated)
 
@@ -313,6 +323,7 @@ class Model:
                     self.logger.warning('Voice websocket not available after connection')
                 else:
                     self.logger.info('Voice connection established successfully')
+                    self.desired_voice_channels[channel.guild.id] = channel.id
                     break  # Success, exit retry loop
                     
             except asyncio.TimeoutError:
@@ -371,6 +382,11 @@ class Model:
         self.opus_encoder_private.opus_encoder_ctl(getattr(self.opus_encoder, '_state'), CTL_RESET_STATE)
 
     async def leave_voice(self, channel: discord.VoiceChannel) -> None:
+        self.desired_voice_channels.pop(channel.guild.id, None)
+        self.voice_send_failures.pop(channel.guild.id, None)
+        reconnect_task = self.voice_reconnect_tasks.pop(channel.guild.id, None)
+        if reconnect_task is not None and not reconnect_task.done():
+            reconnect_task.cancel()
         futures = [voice_client.disconnect() for voice_client in typing.cast(typing.List[discord.VoiceClient], self.discord_client.voice_clients) if voice_client.channel == channel]
         if futures:
             try:
@@ -508,6 +524,7 @@ class Model:
                             # Only log if this client was previously connected (actual disconnection)
                             voice_client_name = getattr(voice_client.channel, 'name', 'Unknown') if voice_client.channel else 'Unknown'
                             self.logger.warning('Voice client disconnected during encoding loop: {}'.format(voice_client_name))
+                            self._schedule_voice_reconnect(voice_client)
                             previously_connected.discard(id(voice_client))
                 else:
                     for voice_client in current_voice_clients:
@@ -547,6 +564,107 @@ class Model:
             if self.v is not None:
                 self.v.stop()
 
+    def _schedule_voice_reconnect(self, voice_client: discord.VoiceClient) -> None:
+        guild = getattr(voice_client, 'guild', None)
+        if guild is None:
+            return
+
+        guild_id = guild.id
+        existing = self.voice_reconnect_tasks.get(guild_id)
+        if existing is not None and not existing.done():
+            return
+
+        self.voice_reconnect_tasks[guild_id] = asyncio.ensure_future(
+            self._reconnect_voice_client(guild_id),
+            loop=self.loop
+        )
+
+    async def _reconnect_voice_client(self, guild_id: int) -> None:
+        max_attempts = 5
+        delay = 2.0
+        try:
+            for attempt in range(max_attempts):
+                if not self.running:
+                    return
+
+                if any(vc.guild.id == guild_id and vc.is_connected() for vc in typing.cast(typing.List[discord.VoiceClient], self.discord_client.voice_clients)):
+                    connected_client = next((vc for vc in typing.cast(typing.List[discord.VoiceClient], self.discord_client.voice_clients) if vc.guild.id == guild_id and vc.is_connected()), None)
+                    if connected_client is not None and self._is_voice_transport_healthy(connected_client):
+                        self.voice_send_failures.pop(guild_id, None)
+                        return
+                    if connected_client is not None:
+                        self.logger.warning('Voice client appears connected but transport is unhealthy for guild {}, reconnecting.'.format(guild_id))
+                        try:
+                            await connected_client.disconnect(force=True)
+                            await asyncio.sleep(0.5)
+                        except Exception:
+                            pass
+
+                if not self.discord_client.is_ready():
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2.0, 30.0)
+                    continue
+
+                channel = self._get_reconnect_channel(guild_id)
+                if channel is None:
+                    self.logger.warning('Reconnect skipped: no active/known voice channel for guild {}.'.format(guild_id))
+                    return
+
+                self.logger.info('Attempting auto-reconnect to voice channel: {} (attempt {}/{})'.format(channel.name, attempt + 1, max_attempts))
+                await self.join_voice(channel)
+
+                if any(vc.guild.id == guild_id and vc.is_connected() for vc in typing.cast(typing.List[discord.VoiceClient], self.discord_client.voice_clients)):
+                    self.logger.info('Voice auto-reconnect successful for guild {}.'.format(guild_id))
+                    self.voice_send_failures.pop(guild_id, None)
+                    return
+
+                await asyncio.sleep(delay)
+                delay = min(delay * 2.0, 30.0)
+
+            self.logger.error('Voice auto-reconnect failed for guild {} after {} attempts.'.format(guild_id, max_attempts))
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            self.logger.error('Unexpected error during voice auto-reconnect for guild {}: {}'.format(guild_id, str(e)))
+        finally:
+            self.voice_reconnect_tasks.pop(guild_id, None)
+
+    def _get_reconnect_channel(self, guild_id: int) -> typing.Optional[discord.VoiceChannel]:
+        # Prefer the currently attached voice client channel if present.
+        for vc in typing.cast(typing.List[discord.VoiceClient], self.discord_client.voice_clients):
+            if vc.guild.id == guild_id and isinstance(vc.channel, discord.VoiceChannel):
+                return vc.channel
+
+        # Next, use the bot member's current voice state if available.
+        guild = self.discord_client.get_guild(guild_id)
+        if guild is not None and guild.me is not None and guild.me.voice is not None and isinstance(guild.me.voice.channel, discord.VoiceChannel):
+            return guild.me.voice.channel
+
+        # Finally, fall back to last known channel for this guild.
+        channel_id = self.desired_voice_channels.get(guild_id)
+        if channel_id is None:
+            return None
+        channel = self.discord_client.get_channel(channel_id)
+        if isinstance(channel, discord.VoiceChannel):
+            return channel
+        return None
+
+    def _is_voice_transport_healthy(self, voice_client: discord.VoiceClient) -> bool:
+        if not voice_client.is_connected() or voice_client.channel is None:
+            return False
+        connection = getattr(voice_client, '_connection', None)
+        ws = getattr(voice_client, '_ws', None) or getattr(voice_client, 'ws', None)
+        sock = getattr(voice_client, 'socket', None)
+        if connection is None:
+            return False
+        if ws is None:
+            return False
+        if getattr(ws, 'closed', False):
+            return False
+        if sock is None:
+            return False
+        return True
+
     # A rewrite of discord.VoiceClient.send_audio_packet.
     # The timestamp is supplied from outside so all silent frames get counted.
     def _send_audio_packet(self, voice_client: discord.VoiceClient, opus_packet: bytes, timestamp_frames: int) -> typing.Callable[[], None]:
@@ -559,28 +677,54 @@ class Model:
 
         def send() -> None:
             if sock is None:
+                self._record_voice_send_failure(voice_client)
                 return
             if not voice_client.is_connected():
+                self._record_voice_send_failure(voice_client)
                 return
             try:
                 connection = getattr(voice_client, '_connection', None)
                 if connection is not None:
                     connection.send_packet(udp_packet)
+                    self._clear_voice_send_failures(voice_client)
                 else:
                     # Fallback: try to send directly via socket
                     if hasattr(voice_client, 'endpoint_ip') and hasattr(voice_client, 'voice_port'):
                         try:
                             sock.sendto(udp_packet, (voice_client.endpoint_ip, voice_client.voice_port))
+                            self._clear_voice_send_failures(voice_client)
                         except Exception as e:
                             self.logger.warning('Failed to send packet via socket: {}'.format(str(e)))
+                            self._record_voice_send_failure(voice_client)
                     else:
                         self.logger.warning('Voice connection endpoint not available')
+                        self._record_voice_send_failure(voice_client)
             except AttributeError as e:
                 self.logger.warning('Voice connection attribute missing: {}'.format(str(e)))
+                self._record_voice_send_failure(voice_client)
             except OSError as e:
                 self.logger.warning('Network error sending packet: {}'.format(str(e)))
+                self._record_voice_send_failure(voice_client)
 
         return send
+
+    def _clear_voice_send_failures(self, voice_client: discord.VoiceClient) -> None:
+        guild = getattr(voice_client, 'guild', None)
+        if guild is None:
+            return
+        self.voice_send_failures.pop(guild.id, None)
+
+    def _record_voice_send_failure(self, voice_client: discord.VoiceClient) -> None:
+        guild = getattr(voice_client, 'guild', None)
+        if guild is None:
+            return
+        guild_id = guild.id
+        failures = self.voice_send_failures.get(guild_id, 0) + 1
+        self.voice_send_failures[guild_id] = failures
+        if failures >= 25:
+            channel_name = getattr(voice_client.channel, 'name', 'Unknown') if voice_client.channel is not None else 'Unknown'
+            self.logger.warning('Repeated voice packet send failures on {}, scheduling reconnect.'.format(channel_name))
+            self._schedule_voice_reconnect(voice_client)
 
     def _set_speaking_state(self, voice_client: discord.VoiceClient, state: int, timestamp_ns: int) -> None:
         setattr(voice_client, '_dmb_speaking', state)
