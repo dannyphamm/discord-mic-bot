@@ -47,7 +47,7 @@ class SoundDevice:
 
 
 class Model:
-    __slots__ = ['v', 'loop', 'running', 'logger', 'discord_bot_token', 'discord_client', 'login_status', 'current_viewing_guild', 'input_stream', 'audio_warning_count', 'audio_queue', 'muted', 'opus_encoder', 'opus_encoder_private', 'opus_encoder_executor', 'lu_meter', 'auto_join_channel_id', 'desired_voice_channels', 'voice_reconnect_tasks', 'voice_send_failures', 'voice_disconnect_warnings']
+    __slots__ = ['v', 'loop', 'running', 'logger', 'discord_bot_token', 'discord_client', 'login_status', 'current_viewing_guild', 'input_stream', 'audio_warning_count', 'audio_queue', 'muted', 'opus_encoder', 'opus_encoder_private', 'opus_encoder_executor', 'lu_meter', 'auto_join_channel_id', 'desired_voice_channels', 'voice_reconnect_tasks', 'voice_send_failures', 'voice_disconnect_warnings', 'gateway_was_disconnected']
     muted_frame = array.array('f', [0.0] * (48000 * 20 // 1000 * 2))
 
     def __init__(self, discord_bot_token: str, loop: asyncio.AbstractEventLoop, auto_join_channel_id: typing.Optional[str] = None) -> None:
@@ -89,6 +89,7 @@ class Model:
         self.voice_reconnect_tasks: typing.Dict[int, asyncio.Task[None]] = {}
         self.voice_send_failures: typing.Dict[int, int] = {}
         self.voice_disconnect_warnings: typing.Dict[int, int] = {}
+        self.gateway_was_disconnected = False
 
         self._set_up_events()
 
@@ -105,6 +106,7 @@ class Model:
         async def on_disconnect() -> None:
             if self.running:
                 self.login_status = 'Reconnecting…'
+                self.gateway_was_disconnected = True
             else:
                 self.login_status = 'Disconnected from Discord.'
             self.logger.info(self.login_status)
@@ -149,6 +151,9 @@ class Model:
             if self.v is not None:
                 self.v.loop.call_soon_threadsafe(self.v.login_status_updated)
                 self.v.loop.call_soon_threadsafe(self.v.guilds_updated)
+            if self.gateway_was_disconnected:
+                self.gateway_was_disconnected = False
+                self._schedule_voice_reconnect_all('Gateway session resumed')
 
         self.discord_client.event(on_resumed)
 
@@ -582,10 +587,58 @@ class Model:
             loop=self.loop
         )
 
-    async def _reconnect_voice_client(self, guild_id: int) -> None:
+    def _schedule_voice_reconnect_all(self, reason: str) -> None:
+        guild_ids = set(self.desired_voice_channels.keys())
+        for voice_client in typing.cast(typing.List[discord.VoiceClient], self.discord_client.voice_clients):
+            guild = getattr(voice_client, 'guild', None)
+            if guild is not None:
+                guild_ids.add(guild.id)
+
+        if not guild_ids:
+            return
+
+        self.logger.info('Recreating voice sessions after {} for {} guild(s).'.format(reason, len(guild_ids)))
+        for guild_id in guild_ids:
+            existing = self.voice_reconnect_tasks.get(guild_id)
+            if existing is not None and not existing.done():
+                continue
+            self.voice_reconnect_tasks[guild_id] = asyncio.ensure_future(
+                self._reconnect_voice_client(guild_id, force_recreate=True),
+                loop=self.loop
+            )
+
+    async def _recreate_voice_session(self, guild_id: int) -> bool:
+        channel = self._get_reconnect_channel(guild_id)
+        if channel is None:
+            self.logger.warning('Voice session recreate skipped: no active/known voice channel for guild {}.'.format(guild_id))
+            return False
+
+        for voice_client in typing.cast(typing.List[discord.VoiceClient], list(self.discord_client.voice_clients)):
+            if voice_client.guild.id != guild_id:
+                continue
+            try:
+                self.logger.info('Disconnecting stale voice session in: {}'.format(channel.name))
+                await voice_client.disconnect(force=True)
+            except Exception as e:
+                self.logger.warning('Error disconnecting stale voice session: {}'.format(str(e)))
+            await asyncio.sleep(0.5)
+
+        self.logger.info('Recreating voice session in: {}'.format(channel.name))
+        await self.join_voice(channel)
+        return any(vc.guild.id == guild_id and vc.is_connected() for vc in typing.cast(typing.List[discord.VoiceClient], self.discord_client.voice_clients))
+
+    async def _reconnect_voice_client(self, guild_id: int, force_recreate: bool = False) -> None:
         max_attempts = 5
         delay = 2.0
+        soft_recovery_attempts = 0
         try:
+            if force_recreate:
+                if await self._recreate_voice_session(guild_id):
+                    self.logger.info('Voice session recreated successfully for guild {}.'.format(guild_id))
+                    self.voice_send_failures.pop(guild_id, None)
+                    self.voice_disconnect_warnings.pop(guild_id, None)
+                    return
+
             for attempt in range(max_attempts):
                 if not self.running:
                     return
@@ -597,16 +650,26 @@ class Model:
                         self.voice_disconnect_warnings.pop(guild_id, None)
                         return
                     if connected_client is not None:
-                        self.logger.warning('Voice client appears connected but transport is unhealthy for guild {}, attempting in-place recovery.'.format(guild_id))
+                        soft_recovery_attempts += 1
+                        if soft_recovery_attempts >= 3:
+                            self.logger.warning('Voice transport still unhealthy for guild {} after {} soft recoveries, recreating session.'.format(guild_id, soft_recovery_attempts))
+                            if await self._recreate_voice_session(guild_id):
+                                self.logger.info('Voice session recreated successfully for guild {}.'.format(guild_id))
+                                self.voice_send_failures.pop(guild_id, None)
+                                self.voice_disconnect_warnings.pop(guild_id, None)
+                                return
+                            await asyncio.sleep(delay)
+                            delay = min(delay * 2.0, 30.0)
+                            continue
+
+                        self.logger.warning('Voice client appears connected but transport is unhealthy for guild {}, attempting in-place recovery ({}/3).'.format(guild_id, soft_recovery_attempts))
                         self._clear_voice_send_failures(connected_client)
                         self._clear_disconnect_warning_streak(connected_client)
-                        # Soft recovery first: reset encoder state and re-assert speaking state without leaving channel.
                         await self.loop.run_in_executor(self.opus_encoder_executor, self._reset_opus_encoder)
                         self._set_speaking_state(connected_client, discord.SpeakingState.none, time.monotonic_ns())
                         await asyncio.sleep(0.1)
                         self._set_speaking_state(connected_client, discord.SpeakingState.voice, time.monotonic_ns())
                         await asyncio.sleep(0.5)
-                        # Do not kick/rejoin while still connected; keep trying in-place recovery only.
                         continue
 
                 if not self.discord_client.is_ready():
@@ -749,9 +812,9 @@ class Model:
         guild_id = guild.id
         warnings = self.voice_disconnect_warnings.get(guild_id, 0) + 1
         self.voice_disconnect_warnings[guild_id] = warnings
-        if warnings >= 20:
+        if warnings == 1:
             channel_name = getattr(voice_client.channel, 'name', 'Unknown') if voice_client.channel is not None else 'Unknown'
-            self.logger.warning('Continuous voice disconnect warnings on {}, scheduling reconnect.'.format(channel_name))
+            self.logger.warning('Voice disconnect detected on {}, scheduling session recreate.'.format(channel_name))
             self._schedule_voice_reconnect(voice_client)
 
     def _set_speaking_state(self, voice_client: discord.VoiceClient, state: int, timestamp_ns: int) -> None:
