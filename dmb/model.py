@@ -48,7 +48,7 @@ class SoundDevice:
 
 
 class Model:
-    __slots__ = ['v', 'loop', 'running', 'logger', 'discord_bot_token', 'discord_client', 'login_status', 'current_viewing_guild', 'input_stream', 'audio_warning_count', 'audio_queue', 'muted', 'opus_encoder', 'opus_encoder_private', 'opus_encoder_executor', 'lu_meter', 'auto_join_channel_id', 'desired_voice_channels', 'voice_reconnect_tasks', 'voice_send_failures', 'voice_disconnect_warnings', 'gateway_was_disconnected', 'daily_voice_reconnect_task']
+    __slots__ = ['v', 'loop', 'running', 'logger', 'discord_bot_token', 'discord_client', 'login_status', 'current_viewing_guild', 'input_stream', 'audio_warning_count', 'audio_queue', 'muted', 'opus_encoder', 'opus_encoder_private', 'opus_encoder_executor', 'lu_meter', 'auto_join_channel_id', 'desired_voice_channels', 'voice_reconnect_tasks', 'voice_send_failures', 'voice_disconnect_warnings', 'daily_voice_reconnect_task']
     muted_frame = array.array('f', [0.0] * (48000 * 20 // 1000 * 2))
 
     def __init__(self, discord_bot_token: str, loop: asyncio.AbstractEventLoop, auto_join_channel_id: typing.Optional[str] = None) -> None:
@@ -90,7 +90,6 @@ class Model:
         self.voice_reconnect_tasks: typing.Dict[int, asyncio.Task[None]] = {}
         self.voice_send_failures: typing.Dict[int, int] = {}
         self.voice_disconnect_warnings: typing.Dict[int, int] = {}
-        self.gateway_was_disconnected = False
         self.daily_voice_reconnect_task: typing.Optional[asyncio.Task[None]] = None
 
         self._set_up_events()
@@ -108,7 +107,6 @@ class Model:
         async def on_disconnect() -> None:
             if self.running:
                 self.login_status = 'Reconnecting…'
-                self.gateway_was_disconnected = True
             else:
                 self.login_status = 'Disconnected from Discord.'
             self.logger.info(self.login_status)
@@ -153,9 +151,6 @@ class Model:
             if self.v is not None:
                 self.v.loop.call_soon_threadsafe(self.v.login_status_updated)
                 self.v.loop.call_soon_threadsafe(self.v.guilds_updated)
-            if self.gateway_was_disconnected:
-                self.gateway_was_disconnected = False
-                self._schedule_voice_reconnect_all('Gateway session resumed')
 
         self.discord_client.event(on_resumed)
 
