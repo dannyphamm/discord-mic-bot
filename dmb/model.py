@@ -19,6 +19,7 @@ import asyncio
 import asyncio.queues
 import concurrent.futures
 import ctypes
+import datetime
 import logging
 import time
 import traceback
@@ -47,7 +48,7 @@ class SoundDevice:
 
 
 class Model:
-    __slots__ = ['v', 'loop', 'running', 'logger', 'discord_bot_token', 'discord_client', 'login_status', 'current_viewing_guild', 'input_stream', 'audio_warning_count', 'audio_queue', 'muted', 'opus_encoder', 'opus_encoder_private', 'opus_encoder_executor', 'lu_meter', 'auto_join_channel_id', 'desired_voice_channels', 'voice_reconnect_tasks', 'voice_send_failures', 'voice_disconnect_warnings', 'gateway_was_disconnected']
+    __slots__ = ['v', 'loop', 'running', 'logger', 'discord_bot_token', 'discord_client', 'login_status', 'current_viewing_guild', 'input_stream', 'audio_warning_count', 'audio_queue', 'muted', 'opus_encoder', 'opus_encoder_private', 'opus_encoder_executor', 'lu_meter', 'auto_join_channel_id', 'desired_voice_channels', 'voice_reconnect_tasks', 'voice_send_failures', 'voice_disconnect_warnings', 'gateway_was_disconnected', 'daily_voice_reconnect_task']
     muted_frame = array.array('f', [0.0] * (48000 * 20 // 1000 * 2))
 
     def __init__(self, discord_bot_token: str, loop: asyncio.AbstractEventLoop, auto_join_channel_id: typing.Optional[str] = None) -> None:
@@ -90,6 +91,7 @@ class Model:
         self.voice_send_failures: typing.Dict[int, int] = {}
         self.voice_disconnect_warnings: typing.Dict[int, int] = {}
         self.gateway_was_disconnected = False
+        self.daily_voice_reconnect_task: typing.Optional[asyncio.Task[None]] = None
 
         self._set_up_events()
 
@@ -628,7 +630,7 @@ class Model:
         return any(vc.guild.id == guild_id and vc.is_connected() for vc in typing.cast(typing.List[discord.VoiceClient], self.discord_client.voice_clients))
 
     async def _reconnect_voice_client(self, guild_id: int, force_recreate: bool = False) -> None:
-        max_attempts = 5
+        max_attempts = 20
         delay = 2.0
         soft_recovery_attempts = 0
         try:
@@ -701,6 +703,24 @@ class Model:
             self.logger.error('Unexpected error during voice auto-reconnect for guild {}: {}'.format(guild_id, str(e)))
         finally:
             self.voice_reconnect_tasks.pop(guild_id, None)
+
+    async def _daily_voice_reconnect_loop(self) -> None:
+        while self.running:
+            now = datetime.datetime.now()
+            next_run = now.replace(hour=6, minute=0, second=0, microsecond=0)
+            if now >= next_run:
+                next_run += datetime.timedelta(days=1)
+            wait_seconds = (next_run - now).total_seconds()
+            self.logger.info('Next scheduled voice reconnect at {} (in {:.0f} minutes).'.format(
+                next_run.strftime('%Y-%m-%d %H:%M:%S'), wait_seconds / 60))
+            try:
+                await asyncio.sleep(wait_seconds)
+            except asyncio.CancelledError:
+                return
+            if not self.running:
+                return
+            self.logger.info('Running scheduled 6 AM voice reconnect.')
+            self._schedule_voice_reconnect_all('Scheduled 6 AM reconnect')
 
     def _get_reconnect_channel(self, guild_id: int) -> typing.Optional[discord.VoiceChannel]:
         # Prefer the currently attached voice client channel if present.
@@ -846,6 +866,7 @@ class Model:
     async def run(self) -> None:
         try:
             asyncio.ensure_future(self._encode_voice_loop(), loop=self.loop)
+            self.daily_voice_reconnect_task = asyncio.ensure_future(self._daily_voice_reconnect_loop(), loop=self.loop)
 
             self.login_status = 'Logging in…'
             self.logger.info(self.login_status)
@@ -873,6 +894,8 @@ class Model:
         asyncio.ensure_future(self._stop(), loop=self.loop)
 
     async def _stop(self) -> None:
+        if self.daily_voice_reconnect_task is not None:
+            self.daily_voice_reconnect_task.cancel()
         await self.discord_client.close()
         self.audio_queue.put_nowait(None)
         self.opus_encoder_executor.shutdown()
