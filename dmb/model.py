@@ -48,8 +48,9 @@ class SoundDevice:
 
 
 class Model:
-    __slots__ = ['v', 'loop', 'running', 'logger', 'discord_bot_token', 'discord_client', 'login_status', 'current_viewing_guild', 'input_stream', 'audio_warning_count', 'audio_queue', 'muted', 'opus_encoder', 'opus_encoder_private', 'opus_encoder_executor', 'lu_meter', 'auto_join_channel_id', 'desired_voice_channels', 'voice_reconnect_tasks', 'voice_send_failures', 'voice_disconnect_warnings', 'daily_voice_reconnect_task']
+    __slots__ = ['v', 'loop', 'running', 'logger', 'discord_bot_token', 'discord_client', 'login_status', 'current_viewing_guild', 'input_stream', 'audio_warning_count', 'audio_queue', 'muted', 'opus_encoder', 'opus_encoder_private', 'opus_encoder_executor', 'lu_meter', 'auto_join_channel_id', 'desired_voice_channels', 'voice_reconnect_tasks', 'voice_send_failures', 'voice_disconnect_warnings', 'voice_disconnect_grace_tasks', 'daily_voice_reconnect_task']
     muted_frame = array.array('f', [0.0] * (48000 * 20 // 1000 * 2))
+    voice_disconnect_grace_seconds = 30.0
 
     def __init__(self, discord_bot_token: str, loop: asyncio.AbstractEventLoop, auto_join_channel_id: typing.Optional[str] = None) -> None:
         self.v: typing.Optional['view.View'] = None
@@ -90,6 +91,7 @@ class Model:
         self.voice_reconnect_tasks: typing.Dict[int, asyncio.Task[None]] = {}
         self.voice_send_failures: typing.Dict[int, int] = {}
         self.voice_disconnect_warnings: typing.Dict[int, int] = {}
+        self.voice_disconnect_grace_tasks: typing.Dict[int, asyncio.Task[None]] = {}
         self.daily_voice_reconnect_task: typing.Optional[asyncio.Task[None]] = None
 
         self._set_up_events()
@@ -295,8 +297,8 @@ class Model:
                         return
                 
                 # Disconnect from any existing voice connections in the same guild first
-                for voice_client in typing.cast(typing.List[discord.VoiceClient], self.discord_client.voice_clients):
-                    if voice_client.guild == channel.guild and voice_client.is_connected():
+                for voice_client in typing.cast(typing.List[discord.VoiceClient], list(self.discord_client.voice_clients)):
+                    if voice_client.guild == channel.guild:
                         try:
                             await voice_client.disconnect(force=True)
                             await asyncio.sleep(0.5)  # Give it more time to clean up
@@ -388,6 +390,9 @@ class Model:
         self.desired_voice_channels.pop(channel.guild.id, None)
         self.voice_send_failures.pop(channel.guild.id, None)
         self.voice_disconnect_warnings.pop(channel.guild.id, None)
+        grace_task = self.voice_disconnect_grace_tasks.pop(channel.guild.id, None)
+        if grace_task is not None and not grace_task.done():
+            grace_task.cancel()
         reconnect_task = self.voice_reconnect_tasks.pop(channel.guild.id, None)
         if reconnect_task is not None and not reconnect_task.done():
             reconnect_task.cancel()
@@ -526,9 +531,6 @@ class Model:
                                 self.logger.info('Continue speaking on: {}'.format(voice_client_name))
                                 self._set_speaking_state(voice_client, discord.SpeakingState.voice, timestamp_ns)
                         elif id(voice_client) in previously_connected:
-                            # Only log if this client was previously connected (actual disconnection)
-                            voice_client_name = getattr(voice_client.channel, 'name', 'Unknown') if voice_client.channel else 'Unknown'
-                            self.logger.warning('Voice client disconnected during encoding loop: {}'.format(voice_client_name))
                             self._record_disconnect_warning(voice_client)
                             previously_connected.discard(id(voice_client))
                 else:
@@ -573,8 +575,9 @@ class Model:
         guild = getattr(voice_client, 'guild', None)
         if guild is None:
             return
+        self._schedule_voice_reconnect_for_guild(guild.id)
 
-        guild_id = guild.id
+    def _schedule_voice_reconnect_for_guild(self, guild_id: int) -> None:
         existing = self.voice_reconnect_tasks.get(guild_id)
         if existing is not None and not existing.done():
             return
@@ -818,7 +821,11 @@ class Model:
         guild = getattr(voice_client, 'guild', None)
         if guild is None:
             return
-        self.voice_disconnect_warnings.pop(guild.id, None)
+        guild_id = guild.id
+        self.voice_disconnect_warnings.pop(guild_id, None)
+        grace_task = self.voice_disconnect_grace_tasks.pop(guild_id, None)
+        if grace_task is not None and not grace_task.done():
+            grace_task.cancel()
 
     def _record_disconnect_warning(self, voice_client: discord.VoiceClient) -> None:
         guild = getattr(voice_client, 'guild', None)
@@ -829,8 +836,47 @@ class Model:
         self.voice_disconnect_warnings[guild_id] = warnings
         if warnings == 1:
             channel_name = getattr(voice_client.channel, 'name', 'Unknown') if voice_client.channel is not None else 'Unknown'
-            self.logger.warning('Voice disconnect detected on {}, scheduling session recreate.'.format(channel_name))
-            self._schedule_voice_reconnect(voice_client)
+            self.logger.warning('Voice disconnect detected on {}, waiting {:.0f}s before reconnect.'.format(
+                channel_name, self.voice_disconnect_grace_seconds))
+            existing_grace = self.voice_disconnect_grace_tasks.get(guild_id)
+            if existing_grace is None or existing_grace.done():
+                self.voice_disconnect_grace_tasks[guild_id] = asyncio.ensure_future(
+                    self._voice_disconnect_grace_period(guild_id),
+                    loop=self.loop
+                )
+
+    async def _voice_disconnect_grace_period(self, guild_id: int) -> None:
+        try:
+            await asyncio.sleep(self.voice_disconnect_grace_seconds)
+            if not self.running:
+                return
+
+            connected_client = next(
+                (vc for vc in typing.cast(typing.List[discord.VoiceClient], self.discord_client.voice_clients)
+                 if vc.guild.id == guild_id),
+                None
+            )
+            if connected_client is not None and connected_client.is_connected() and self._is_voice_transport_healthy(connected_client):
+                channel_name = getattr(connected_client.channel, 'name', 'Unknown') if connected_client.channel is not None else 'Unknown'
+                self.logger.info('Voice connection recovered during grace period on {}.'.format(channel_name))
+                self.voice_disconnect_warnings.pop(guild_id, None)
+                return
+
+            channel_name = 'Unknown'
+            if connected_client is not None and connected_client.channel is not None:
+                channel_name = getattr(connected_client.channel, 'name', 'Unknown')
+            elif guild_id in self.desired_voice_channels:
+                channel = self.discord_client.get_channel(self.desired_voice_channels[guild_id])
+                if isinstance(channel, discord.VoiceChannel):
+                    channel_name = channel.name
+
+            self.logger.warning('Voice still disconnected after {:.0f}s grace period on {}, scheduling session recreate.'.format(
+                self.voice_disconnect_grace_seconds, channel_name))
+            self._schedule_voice_reconnect_for_guild(guild_id)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self.voice_disconnect_grace_tasks.pop(guild_id, None)
 
     def _set_speaking_state(self, voice_client: discord.VoiceClient, state: int, timestamp_ns: int) -> None:
         setattr(voice_client, '_dmb_speaking', state)
