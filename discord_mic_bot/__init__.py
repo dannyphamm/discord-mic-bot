@@ -16,54 +16,68 @@
 
 import asyncio
 import concurrent.futures
+import os
 import threading
-from . import model
-from . import view
-from typing import Optional
+import typing
+
+if typing.TYPE_CHECKING:
+    from . import model
 
 
 class ModelThread(threading.Thread):
-    def __init__(self, discord_bot_token: str, auto_join_channel_id: Optional[str] = None) -> None:
+    def __init__(self, discord_bot_token: str, auto_join_channel_id: typing.Optional[str] = None) -> None:
         super().__init__()
         self.discord_bot_token = discord_bot_token
         self.auto_join_channel_id = auto_join_channel_id
-        self.init_finished: concurrent.futures.Future[model.Model] = concurrent.futures.Future()
+        self.init_finished: concurrent.futures.Future['model.Model'] = concurrent.futures.Future()
 
     def run(self) -> None:
         loop = asyncio.new_event_loop()
-        loop.run_until_complete(self._run(loop))
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._run(loop))
+        except BaseException as exc:
+            if not self.init_finished.done():
+                self.init_finished.set_exception(exc)
+            raise
+        finally:
+            loop.close()
 
     async def _run(self, loop: asyncio.AbstractEventLoop) -> None:
+        from . import model
+
         m = model.Model(self.discord_bot_token, loop, self.auto_join_channel_id)
         self.init_finished.set_result(m)
         await m.run()
 
 
 class UIThread:
-    def __init__(self, m: model.Model) -> None:
+    def __init__(self, m: 'model.Model') -> None:
         self.m = m
 
     def run(self) -> None:
         loop = asyncio.new_event_loop()
-        loop.run_until_complete(self._run(loop))
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._run(loop))
+        finally:
+            loop.close()
 
     async def _run(self, loop: asyncio.AbstractEventLoop) -> None:
+        from . import view
+
         v = view.View(self.m, loop)
         await v.run()
 
 
 def main() -> None:
-    try:
-        with open('token.txt', 'r') as token_file:
-            lines = token_file.read().strip().splitlines()
-            discord_bot_token = lines[0] if len(lines) > 0 else ''
-            auto_join_channel_id: Optional[str] = lines[1] if len(lines) > 1 else None
-        if not discord_bot_token:
-            raise ValueError
-    except (FileNotFoundError, ValueError):
+    discord_bot_token = os.environ.get('DISCORD_BOT_TOKEN', '').strip()
+    if not discord_bot_token:
         print('Unable to find a Discord bot token.')
-        print('Please put your Discord bot token in token.txt.')
+        print('Please set the DISCORD_BOT_TOKEN environment variable.')
         return
+
+    auto_join_channel_id = os.environ.get('DISCORD_AUTO_JOIN_CHANNEL_ID', '').strip() or None
 
     model_thread = ModelThread(discord_bot_token, auto_join_channel_id)
     model_thread.start()
@@ -73,5 +87,6 @@ def main() -> None:
         ui_thread = UIThread(m)
         ui_thread.run()
     finally:
-        m.stop()
+        shutdown_finished = m.stop()
+        shutdown_finished.result()
         model_thread.join()
